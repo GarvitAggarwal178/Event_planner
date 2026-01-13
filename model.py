@@ -4,6 +4,10 @@ from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 import os
 from dotenv import load_dotenv
+from langgraph.graph import StateGraph, MessagesState, START, END 
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.checkpoint.memory import MemorySaver
 
 class Activity(BaseModel):
     name: str = Field(description="Name of the activity")
@@ -37,7 +41,7 @@ def get_weather(location: str)->str:
 
 load_dotenv()
 if not os.getenv("GOOGLE_API_KEY"):
-    raise ValueError("FATAL: GOOGLE_API_KEY not found. Check your .env file.")
+    raise ValueError("api not found")
 api_key = os.getenv("GOOGLE_API_KEY")
 
 llm = ChatGoogleGenerativeAI(
@@ -47,6 +51,46 @@ llm = ChatGoogleGenerativeAI(
 )
 tools = [calculate_distance, search_places, get_weather]
 llm_with_tools = llm.bind_tools(tools)
+structured_llm = llm.with_structured_output(Trip)
 
-response = llm_with_tools.invoke("How far is it from New York to Washington DC?")
-print(response.tool_calls)
+class AgentState(MessagesState):
+    final: Optional[Trip]
+
+def router(state: AgentState):
+    messages = state["messages"]
+    last = messages[-1]
+
+    if last.tool_calls:
+        return "tools"
+    return "generator"
+
+def generator(state: AgentState):
+    message = state["messages"]
+    system_msg = SystemMessage(content="You are a travel architect. Review the conversation history and extract the final itinerary details into the structured format. If details are missing, make reasonable estimates based on the context.")
+    response = structured_llm.invoke([system_msg]+message)
+    return {"final": response}
+
+def call_model(state: AgentState):
+    past_messages = state["messages"]
+    response = llm_with_tools.invoke(past_messages)
+    return {"messages": [response]}
+
+workflow = StateGraph(AgentState)
+tools_node = ToolNode(tools = tools)
+
+
+
+workflow.add_node("generator",generator)
+workflow.add_node("agent",call_model)
+workflow.add_node("tools",tools_node)
+workflow.add_edge(START,"agent")
+workflow.add_edge("tools","agent")
+
+workflow.add_conditional_edges("agent",router,{"tools": "tools","generator": "generator"})
+workflow.add_edge("generator",END)
+app = workflow.compile()
+
+initial_input = {"messages": [HumanMessage(content="Plan a trip from New York to DC. Check the distance first.")]}
+
+final_state = app.invoke(initial_input,config={"recursion_limit":10})
+print(final_state["final"])
